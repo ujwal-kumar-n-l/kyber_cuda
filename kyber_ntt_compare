@@ -1,0 +1,240 @@
+%%writefile kyber_ntt_check_batch.cu
+// kyber_ntt_batched_fused.cu
+// Fused per-polynomial Kyber NTT: one block per poly, shared-memory, robust twiddle pointer.
+// Compile: nvcc -O3 -arch=sm_75 kyber_ntt_batched_fused.cu -o ntt_fused
+// or:     nvcc -O3 kyber_ntt_batched_fused.cu -o ntt_fused
+
+#include <stdio.h>
+#include <stdint.h>
+#include <cuda.h>
+#include <stdlib.h>
+
+#define N 256
+#define Q 3329
+#ifndef BATCH
+#define BATCH 4096
+#endif
+
+// host twiddles (int32)
+static const int32_t h_zetas32[128] = {
+  2285,2571,2970,1812,1610,186,247,1855,
+  2783,2068,286,157,121,952,188,3083,
+  2869,1574,1653,3082,2378,2931,3038,83,
+  1847,2335,870,1515,621,2300,3526,3297,
+  1223,2240,4070,2911,3258,1994,2375,3256,
+  1944,3928,3032,1218,910,2546,3218,2150,
+  198,1570,777,2868,2544,1164,2143,1339,
+  238,977,939,1165,3180,3550,3260,2781,
+  2475,2828,1015,2822,1902,1807,3763,1715,
+  3966,1457,2144,3065,222,2140,230,2800,
+  2999,3053,2856,2210,1927,251,908,2257,
+  3915,627,1742,3303,1035,1253,2382,580,
+  301,1767,1827,3035,2501,2644,2167,1395,
+  3262,1158,2761,2132,3351,1598,1180,654,
+  3223,383,351,1023,2379,3197,3158,2367
+};
+
+// 64-bit multiply then mod Q (device)
+__device__ __forceinline__ int32_t mulmod32_dev(int32_t a, int32_t b) {
+    long long r = (long long)a * (long long)b;
+    r %= Q;
+    if (r < 0) r += Q;
+    return (int32_t)r;
+}
+
+// Fused per-poly NTT kernel
+// grid.x = BATCH (one block per poly)
+// blockDim.x = 128 (threads) -> each thread handles one 'j' inside inner loop; we loop over start-blocks
+// shared memory: full poly of 256 int32 elements
+__global__
+void ntt_fused_perpoly(int32_t *d_all, const int32_t *d_zetas) {
+    // per-block: process polynomial = blockIdx.x
+    int poly = blockIdx.x;
+    // use 128 threads per block (max needed)
+    const int tid = threadIdx.x;
+    // shared buffer for entire poly (256 int32)
+    __shared__ int32_t s[N];
+
+    // load polynomial into shared memory (each thread loads two elements)
+    int base = poly * N;
+    // thread 0..127 loads s[tid] and s[tid+128]
+    int idx0 = base + tid;
+    int idx1 = base + tid + 128;
+    s[tid] = d_all[idx0];
+    s[tid + 128] = d_all[idx1];
+    __syncthreads();
+
+    // Now perform all NTT stages in shared memory
+    // z_offset progression like Kyber
+    int z_offset = 0;
+
+    for (int len = N/2; len >= 2; len >>= 1) {
+        int blocks_per_stage = N / (2 * len); // 1,2,4,...,128
+
+        // for each start-block in this stage, do butterfly with thread index tid < len
+        // if current pthread index >= len, it stays idle for this stage
+        if (tid < len) {
+            for (int sb = 0; sb < blocks_per_stage; ++sb) {
+                int idx_a = sb * (2*len) + tid;      // index inside s
+                int idx_b = idx_a + len;
+
+                int32_t u = s[idx_a];
+                int32_t v = s[idx_b];
+
+                // zeta for this start-block
+                int32_t zeta = d_zetas[z_offset + sb];
+
+                // t = zeta * v mod q
+                int32_t t = mulmod32_dev(zeta, v);
+
+                int32_t r1 = u + t; if (r1 >= Q) r1 -= Q;
+                int32_t r2 = u - t; if (r2 < 0) r2 += Q;
+
+                s[idx_a] = r1;
+                s[idx_b] = r2;
+            }
+        }
+        // next stage z offset
+        z_offset += blocks_per_stage;
+        __syncthreads(); // ensure all butterflies for this stage are done before next stage
+    }
+
+    // final write back: each thread writes two elements
+    d_all[base + tid] = s[tid];
+    d_all[base + tid + 128] = s[tid + 128];
+}
+
+// CPU reference (32-bit)
+static inline int32_t mulmod_cpu32(int32_t a, int32_t b) {
+    long long r = (long long)a * (long long)b;
+    r %= Q;
+    if (r < 0) r += Q;
+    return (int32_t)r;
+}
+void kyber_ntt_cpu_ref32(int32_t *a) {
+    int len = N/2;
+    int z = 0;
+    while (len >= 2) {
+        int blocks = N / (2 * len);
+        for (int sb = 0; sb < blocks; ++sb) {
+            for (int j = 0; j < len; ++j) {
+                int idx1 = sb*(2*len) + j;
+                int idx2 = idx1 + len;
+                int32_t t = mulmod_cpu32(h_zetas32[z], a[idx2]);
+                int32_t u = a[idx1];
+                int32_t v = u + t; if (v >= Q) v -= Q;
+                int32_t w = u - t; if (w < 0) w += Q;
+                a[idx1] = v;
+                a[idx2] = w;
+            }
+            z++;
+        }
+        len >>= 1;
+    }
+}
+int main() {
+    printf("Running FUSED batched Kyber NTT (BATCH=%d)\n", BATCH);
+
+    // create device buffer for zetas and copy
+    int32_t *d_zetas = NULL;
+    cudaMalloc((void**)&d_zetas, sizeof(h_zetas32));
+    cudaMemcpy(d_zetas, h_zetas32, sizeof(h_zetas32), cudaMemcpyHostToDevice);
+
+    // allocate polynomials as int32
+    size_t bytes = (size_t)BATCH * N * sizeof(int32_t);
+    int32_t *h = (int32_t*)malloc(bytes);
+    for (int i = 0; i < BATCH*N; ++i) h[i] = i % Q;
+
+    int32_t *d_all;
+    cudaMalloc((void**)&d_all, bytes);
+    cudaMemcpy(d_all, h, bytes, cudaMemcpyHostToDevice);
+
+    //---------------------------------------------
+    // 1) CPU NTT timing (single polynomial)
+    //---------------------------------------------
+    struct timespec cpu_start, cpu_end;
+    int32_t cpu_poly[N];
+
+    // prepare input
+    for (int i = 0; i < N; ++i) cpu_poly[i] = i % Q;
+
+    clock_gettime(CLOCK_MONOTONIC, &cpu_start);
+
+    kyber_ntt_cpu_ref32(cpu_poly);
+
+    clock_gettime(CLOCK_MONOTONIC, &cpu_end);
+
+    long cpu_ns =
+        (cpu_end.tv_sec - cpu_start.tv_sec) * 1000000000LL +
+        (cpu_end.tv_nsec - cpu_start.tv_nsec);
+
+    double cpu_us = cpu_ns / 1000.0;
+
+    printf("CPU NTT Time = %.3f microseconds\n", cpu_us);
+
+
+    //---------------------------------------------
+    // 2) GPU NTT timing (BATCH fused)
+    //---------------------------------------------
+    cudaEvent_t s, e;
+    cudaEventCreate(&s);
+    cudaEventCreate(&e);
+
+    cudaEventRecord(s);
+
+    dim3 grid(BATCH, 1, 1);
+    dim3 block(128, 1, 1);
+    ntt_fused_perpoly<<<grid, block>>>(d_all, d_zetas);
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(e);
+    cudaEventSynchronize(e);
+
+    float gpu_ms = 0;
+    cudaEventElapsedTime(&gpu_ms, s, e);
+
+    printf("GPU Fused Time = %.6f ms (for %d polys)\n", gpu_ms, BATCH);
+    printf("GPU per-poly time = %.6f microseconds\n", (gpu_ms * 1000.0) / BATCH);
+
+
+    //---------------------------------------------
+    // 3) Correctness check
+    //---------------------------------------------
+    int32_t cpu_ref[N];
+    for (int i = 0; i < N; ++i) cpu_ref[i] = i % Q;
+    kyber_ntt_cpu_ref32(cpu_ref);
+
+    cudaMemcpy(h, d_all, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+    int mismatch = 0;
+    for (int i = 0; i < N; ++i)
+        if (h[i] != cpu_ref[i]) {
+            mismatch = 1;
+            break;
+        }
+
+    printf("Correctness mismatch = %d\n", mismatch);
+    if (!mismatch) {
+        printf("First 16 of poly 0:\n");
+        for (int i = 0; i < 16; ++i) printf("%d ", h[i]);
+        printf("\n");
+    }
+
+    //---------------------------------------------
+    // 4) Speedup calculation
+    //---------------------------------------------
+    // Convert GPU time (per poly) to microseconds
+    double gpu_us_per_poly = (gpu_ms * 1000.0) / BATCH;
+
+    printf("Speedup (CPU_time / GPU_time_per_poly) = %.2f x faster\n",
+           cpu_us / gpu_us_per_poly);
+
+    //---------------------------------------------
+    // Cleanup
+    //---------------------------------------------
+    cudaFree(d_all);
+    cudaFree(d_zetas);
+    free(h);
+
+    return 0;
+}
