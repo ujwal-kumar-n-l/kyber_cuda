@@ -1,0 +1,102 @@
+%%writefile kyber_pointwise_batched.cu
+#include <stdio.h>
+#include <stdint.h>
+#include <cuda_runtime.h>
+#include <stdlib.h>
+
+#define N 256
+#define Q 3329
+#ifndef BATCH
+#define BATCH 4096
+#endif
+
+// --------------------------------------------------
+// CPU helper
+// --------------------------------------------------
+static inline int16_t fqmul_cpu(int16_t a, int16_t b) {
+    int32_t r = (int32_t)a * b;
+    r %= Q;
+    if (r < 0) r += Q;
+    return (int16_t)r;
+}
+
+// --------------------------------------------------
+// GPU helper
+// --------------------------------------------------
+__device__ __forceinline__ int16_t fqmul_gpu(int16_t a, int16_t b) {
+    int32_t r = (int32_t)a * b;
+    r %= Q;
+    if (r < 0) r += Q;
+    return (int16_t)r;
+}
+
+// --------------------------------------------------
+// Batched pointwise multiplication kernel
+// --------------------------------------------------
+__global__ void kyber_pointwise_batched(
+    const int16_t *A,
+    const int16_t *B,
+    int16_t *C
+) {
+    int poly = blockIdx.x;
+    int tid  = threadIdx.x;
+
+    int idx = poly * N + tid;
+
+    C[idx] = fqmul_gpu(A[idx], B[idx]);
+}
+
+// --------------------------------------------------
+// MAIN (test)
+// --------------------------------------------------
+int main() {
+    printf("Running batched pointwise multiplication (BATCH=%d)\n", BATCH);
+
+    size_t bytes = (size_t)BATCH * N * sizeof(int16_t);
+
+    int16_t *hA = (int16_t*)malloc(bytes);
+    int16_t *hB = (int16_t*)malloc(bytes);
+    int16_t *hC = (int16_t*)malloc(bytes);
+
+    for (int i = 0; i < BATCH * N; i++) {
+        hA[i] = (i + 3) % Q;
+        hB[i] = (i * 7) % Q;
+    }
+
+    int16_t *dA, *dB, *dC;
+    cudaMalloc(&dA, bytes);
+    cudaMalloc(&dB, bytes);
+    cudaMalloc(&dC, bytes);
+
+    cudaMemcpy(dA, hA, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, hB, bytes, cudaMemcpyHostToDevice);
+
+    dim3 grid(BATCH);
+    dim3 block(N);   // 256 threads
+
+    kyber_pointwise_batched<<<grid, block>>>(dA, dB, dC);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(hC, dC, bytes, cudaMemcpyDeviceToHost);
+
+    // correctness check (poly 0)
+    int mismatch = 0;
+    for (int i = 0; i < N; i++) {
+        int16_t ref = fqmul_cpu(hA[i], hB[i]);
+        if (hC[i] != ref) {
+            printf("Mismatch at %d: gpu=%d cpu=%d\n", i, hC[i], ref);
+            mismatch = 1;
+            break;
+        }
+    }
+
+    printf("Correctness mismatch = %d\n", mismatch);
+
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dC);
+    free(hA);
+    free(hB);
+    free(hC);
+    return 0;
+}
