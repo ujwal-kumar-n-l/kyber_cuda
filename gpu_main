@@ -1,0 +1,213 @@
+%%bash
+set -e
+
+# ==============================================================================
+#  KYBER: SURGICAL GPU ACCELERATION (Fixed Build Order)
+# ==============================================================================
+rm -rf kyber_fixed
+mkdir kyber_fixed
+cd kyber_fixed
+
+echo "[*] Cloning Official Kyber..."
+git clone https://github.com/pq-crystals/kyber.git > /dev/null 2>&1
+cd kyber/ref
+
+# ==============================================================================
+# 1. DETERMINISTIC RNG
+# ==============================================================================
+cat <<EOF > randombytes.c
+#include "randombytes.h"
+#include <stdint.h>
+static uint32_t seed_counter = 0;
+void randombytes(uint8_t *out, size_t outlen) {
+    for(size_t i=0; i<outlen; i++) out[i] = (uint8_t)(seed_counter++ & 0xFF);
+}
+EOF
+
+# ==============================================================================
+# 2. BENCHMARK HARNESS
+# ==============================================================================
+cat <<EOF > bench_main.c
+#include <stdio.h>
+#include <time.h>
+#include "kem.h"
+
+int main() {
+    uint8_t pk[CRYPTO_PUBLICKEYBYTES], sk[CRYPTO_SECRETKEYBYTES];
+    uint8_t ct[CRYPTO_CIPHERTEXTBYTES], kA[CRYPTO_BYTES], kB[CRYPTO_BYTES];
+
+    // Check if we are CPU or GPU based on the output filename we will write to
+    // (This logic is handled by the wrapper script reading the files,
+    // here we just dump to fixed filenames)
+
+    int N = 2000;
+    printf("Running Batch (%d iterations)... ", N);
+    fflush(stdout);
+
+    clock_t start = clock();
+    for(int i=0; i<N; i++) {
+        crypto_kem_keypair(pk, sk);
+        crypto_kem_enc(ct, kA, pk);
+        crypto_kem_dec(kB, ct, sk);
+    }
+    double t = (double)(clock() - start) / CLOCKS_PER_SEC;
+
+    printf("Done: %.4fs\n", t);
+
+    FILE *f = fopen("stats.txt", "w"); fprintf(f, "%.6f", t); fclose(f);
+    FILE *h = fopen("hash.txt", "w"); fprintf(h, "%02X%02X%02X%02X", kA[0], kA[1], kA[2], kA[3]); fclose(h);
+    return 0;
+}
+EOF
+
+# ==============================================================================
+# 3. COMPILE SHARED DEPENDENCIES
+# ==============================================================================
+echo "[*] Compiling Shared C Components..."
+# We explicitly create .o files here so the linker can find them later
+gcc -c poly.c ntt.c reduce.c cbd.c verify.c randombytes.c \
+       fips202.c symmetric-shake.c indcpa.c kem.c \
+       -O3 -fPIC -w -DKYBER_K=3
+
+# ==============================================================================
+# 4. BUILD CPU BASELINE
+# ==============================================================================
+echo "[*] Building CPU Executable..."
+# Compile polyvec.c normally for CPU
+gcc -c polyvec.c -O3 -fPIC -w -DKYBER_K=3 -o polyvec_cpu.o
+
+# Link CPU version
+gcc -o kyber_cpu bench_main.c polyvec_cpu.o \
+    poly.o ntt.o reduce.o cbd.o verify.o randombytes.o \
+    fips202.o symmetric-shake.o indcpa.o kem.o \
+    -O3 -w
+
+# ==============================================================================
+# 5. PREPARE GPU COMPONENTS
+# ==============================================================================
+echo "[*] Renaming Function in polyvec.c for GPU..."
+# We rename the function inside the file so we can compile a "modified" object file
+sed -i 's/^void polyvec_matrix_pointwise_montgomery/void cpu_polyvec_matrix_pointwise_montgomery/g' polyvec.c
+
+# Compile the MODIFIED polyvec (helper functions like NTT stay, matrix mul is renamed)
+gcc -c polyvec.c -O3 -fPIC -w -DKYBER_K=3 -o polyvec_mod.o
+
+cat <<EOF > gpu_accelerator.cu
+#include <cuda_runtime.h>
+#include <stdint.h>
+extern "C" {
+#include "polyvec.h"
+}
+#define KYBER_Q 3329
+#define QINV -3327
+__constant__ int16_t D_ZETAS[128] = {
+  -1007, -405, -795, -566, 1150, -353, -1393, 1297, 1231, 812, 1197, 747, -1111, -24, -1057, 1233,
+  1455, -1174, -1331, -1124, 1152, 1131, -544, -292, 1085, -1271, -312, 1235, -514, -1185, 452, -1451,
+  1462, 1106, -208, -827, 1250, -11, -1020, 1039, -1501, 715, -450, 1110, 903, -934, 109, 1354,
+  -1065, -1006, -1171, -332, 281, 700, -1184, -1014, -429, 1101, -305, -833, 1136, -745, 1346, -1257,
+  -44, -1318, -1232, 589, 444, 215, -676, 1412, -1458, 804, 1104, 535, -147, -431, -58, -556,
+  -67, -1157, -1436, -1396, 610, 1317, -1202, 1051, -1479, 1275, -531, 237, -1158, 411, -1423, -1141,
+  -1188, -1220, -1321, -386, -33, -762, -1134, -1487, 372, 1182, 1301, -133, -374, -264, -1300, -561,
+  -112, 1238, -113, 1178, -115, 1172, -117, 1166, -119, 1160, -121, 1154, -123, 1148, -125, 1142
+};
+__device__ int16_t mont_reduce(int32_t a) {
+    int16_t u = (int16_t)(a * QINV);
+    int32_t t = (int32_t)u * KYBER_Q;
+    t = a - t; return (int16_t)(t >> 16);
+}
+__device__ int16_t barrett_reduce(int16_t a) {
+    int32_t v = ((int32_t)a * 20159 + (1 << 25)) >> 26;
+    return a - (int16_t)(v * KYBER_Q);
+}
+__device__ int16_t fqmul(int16_t a, int16_t b) { return mont_reduce((int32_t)a * b); }
+
+__global__ void matrix_mul_kernel(int16_t *t_out, int16_t *mat_in, int16_t *v_in, int k) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= k * 256) return;
+    int row = tid / 256;
+    int i = tid % 256;
+    if (i % 2 != 0) return;
+    int zeta_idx = 64 + (i / 4);
+    int16_t zeta = D_ZETAS[zeta_idx];
+    if ((i >> 1) & 1) zeta = -zeta;
+    int32_t r0 = 0, r1 = 0;
+    for(int col=0; col<k; col++) {
+        int idx_m = (row*k + col)*256 + i;
+        int idx_v = col*256 + i;
+        int16_t a0 = mat_in[idx_m], a1 = mat_in[idx_m+1];
+        int16_t b0 = v_in[idx_v],   b1 = v_in[idx_v+1];
+        r0 += fqmul(fqmul(a1, b1), zeta) + fqmul(a0, b0);
+        r1 += fqmul(a0, b1) + fqmul(a1, b0);
+    }
+    t_out[row*256 + i]     = barrett_reduce((int16_t)r0);
+    t_out[row*256 + i + 1] = barrett_reduce((int16_t)r1);
+}
+
+static int16_t *d_t=NULL, *d_mat=NULL, *d_v=NULL;
+
+// This function steals the name back from the CPU version
+extern "C" void polyvec_matrix_pointwise_montgomery(polyvec *t, const polyvec *mat, const polyvec *v) {
+    if (!d_t) {
+        cudaMalloc(&d_t, KYBER_K * 256 * 2);
+        cudaMalloc(&d_mat, KYBER_K * KYBER_K * 256 * 2);
+        cudaMalloc(&d_v, KYBER_K * 256 * 2);
+    }
+    cudaMemcpy(d_mat, mat, KYBER_K*KYBER_K*256*2, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v, KYBER_K*256*2, cudaMemcpyHostToDevice);
+    matrix_mul_kernel<<<(KYBER_K*256+255)/256, 256>>>(d_t, d_mat, d_v, KYBER_K);
+    cudaDeviceSynchronize();
+    cudaMemcpy(t->vec[0].coeffs, d_t, KYBER_K*256*2, cudaMemcpyDeviceToHost);
+}
+EOF
+
+echo "[*] Building GPU Executable..."
+nvcc -c gpu_accelerator.cu -o gpu_accelerator.o -O3
+
+# Link GPU version:
+# We use 'polyvec_mod.o' (contains NTT/Reduce + RENAMED multiplication)
+# We use 'gpu_accelerator.o' (contains the REPLACEMENT multiplication)
+# We use 'poly.o', 'ntt.o', etc. which were compiled in step 3.
+nvcc -o kyber_gpu bench_main.c gpu_accelerator.o polyvec_mod.o \
+    poly.o ntt.o reduce.o cbd.o verify.o randombytes.o \
+    fips202.o symmetric-shake.o indcpa.o kem.o \
+    -O3 -w
+
+# ==============================================================================
+# 6. EXECUTE AND VALIDATE
+# ==============================================================================
+echo ""
+echo ">>> Running CPU (Reference)..."
+./kyber_cpu
+mv stats.txt cpu_time
+mv hash.txt cpu_hash
+
+echo ">>> Running GPU (Accelerated)..."
+./kyber_gpu
+mv stats.txt gpu_time
+mv hash.txt gpu_hash
+
+echo ""
+echo "==========================================="
+echo "             VALIDATION REPORT             "
+echo "==========================================="
+CPU_H=$(cat cpu_hash)
+GPU_H=$(cat gpu_hash)
+T_CPU=$(cat cpu_time)
+T_GPU=$(cat gpu_time)
+
+if [ "$CPU_H" == "$GPU_H" ]; then
+    echo " [PASS] Logic Check: SHARED SECRETS MATCH"
+    echo " Hash: $CPU_H"
+else
+    echo " [FAIL] Logic Check: MISMATCH!"
+    echo " CPU: $CPU_H"
+    echo " GPU: $GPU_H"
+    exit 1
+fi
+
+echo "-------------------------------------------"
+echo " Time CPU: ${T_CPU}s"
+echo " Time GPU: ${T_GPU}s"
+SPEEDUP=$(python3 -c "print(round($T_CPU / $T_GPU, 2))")
+echo " SPEEDUP:  ${SPEEDUP}x"
+echo "==========================================="
