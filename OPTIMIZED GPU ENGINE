@@ -1,0 +1,140 @@
+%%bash
+cd official_kyber_project/kyber/ref
+
+# ==============================================================================
+# 1. OPTIMIZED GPU ENGINE (SHARED MEMORY)
+#    Technique: Alkim et al. / Gupta et al. (SRAM-resident NTT)
+# ==============================================================================
+cat <<EOF > gpu_accelerator.cu
+#include <cuda_runtime.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#define KYBER_Q 3329
+#define QINV -3327
+#define N_INV 3303
+
+// Pre-computed constants
+__constant__ int16_t D_ZETAS[128] = {
+  -1044,  -758,  -359, -1517,  1493,  1422,   287,   202,
+  -171,   622,  1577,   182,   962, -1202, -1474,  1468,
+    573, -1325,   264,   383,  -829,  1458, -1602, -130,
+  -681,  1017,   732,   608, -1542,   411,  -205, -1571,
+   1223,   652,  -552,  1015, -1293,  1491,  -282, -1544,
+    516,    -8, -320,  -666, -1618, -1162,   126,  1469,
+   -853,    -90, -271,   830,   107, -1421, -247,  -951,
+   -398,   961, -1508, -725,   448, -1065,   677, -1275,
+  -1103,   430,   555,   843, -1251,   871,  1550,   105,
+    422,   587,   177,  -235,  -291,  -460,  1574,  1653,
+   -246,   778,  1159,  -147,  -777,  1486,  1418,  1102,
+   1270,   907,   744,   -50, -1660,   746,  -266,   334,
+    -76,  1426, -731,   280,  -557,   767,  -185,  1566,
+   1402,  -565,   -95,  1162,  -549,  -661,  1718,   502,
+   1074,   240,  1157, -1291, -1300,  -544,  1029,  -713,
+   1138, -1338, -37,  1536
+};
+
+// Montgomery Reduction (Optimized PTX)
+__device__ __forceinline__ int16_t montgomery_reduce(int32_t a) {
+    int16_t u = (int16_t)(a * QINV);
+    int32_t t = (int32_t)u * KYBER_Q;
+    t = a - t; t >>= 16; return (int16_t)t;
+}
+__device__ __forceinline__ int16_t fqmul(int16_t a, int16_t b) {
+    return montgomery_reduce((int32_t)a * b);
+}
+
+// ---------------------------------------------------------
+//  PAPER METHOD: Shared Memory (SRAM) Optimization
+// ---------------------------------------------------------
+__global__ void ntt_shared_mem_kernel(int16_t *global_data) {
+    // 1. ALLOCATE FAST SHARED MEMORY (L1 Cache)
+    // We process 1 Polynomial per Block.
+    // Degree 256 requires 256 int16s.
+    __shared__ int16_t s_poly[256];
+
+    int tid = threadIdx.x;        // 0 to 127
+    int bid = blockIdx.x;         // Batch index
+    int offset = bid * 256;       // Global memory offset
+
+    // 2. LOAD FROM DRAM TO SRAM (Coalesced)
+    // Each thread loads 2 coefficients
+    s_poly[2*tid]     = global_data[offset + 2*tid];
+    s_poly[2*tid + 1] = global_data[offset + 2*tid + 1];
+
+    __syncthreads(); // Wait for load to finish
+
+    // 3. COMPUTE NTT IN SRAM (No DRAM Access!)
+    int len = 128;
+    int k_start = 1;
+
+    // 7 Layers of Butterfly Operations
+    #pragma unroll
+    for(int layer = 0; layer < 7; layer++) {
+        int block_idx = tid / len;
+        int idx_in_block = tid % len;
+
+        // Standard Cooley-Tukey Indexing
+        int j = (block_idx * 2 * len) + idx_in_block;
+        int k = k_start + block_idx;
+
+        int16_t zeta = D_ZETAS[k];
+
+        // The Math
+        int16_t t = fqmul(s_poly[j + len], zeta);
+        s_poly[j + len] = s_poly[j] - t;
+        s_poly[j]       = s_poly[j] + t;
+
+        len >>= 1;
+        k_start *= 2;
+
+        __syncthreads(); // Essential Barrier between layers
+    }
+
+    // 4. WRITE BACK TO DRAM (Coalesced)
+    global_data[offset + 2*tid]     = s_poly[2*tid];
+    global_data[offset + 2*tid + 1] = s_poly[2*tid + 1];
+}
+
+// Global Handle
+int16_t *d_data_global = NULL;
+
+extern "C" void gpu_setup(int count) {
+    size_t size = count * 256 * sizeof(int16_t);
+    cudaMalloc(&d_data_global, size);
+    // Warmup
+    ntt_shared_mem_kernel<<<1, 128>>>(d_data_global);
+    cudaDeviceSynchronize();
+}
+
+extern "C" void gpu_teardown() {
+    if (d_data_global) cudaFree(d_data_global);
+}
+
+extern "C" void gpu_run_benchmark(int16_t *host_batch_data, int count) {
+    size_t size = count * 256 * sizeof(int16_t);
+
+    // Copy Host -> Device
+    cudaMemcpy(d_data_global, host_batch_data, size, cudaMemcpyHostToDevice);
+
+    // Launch Optimized Kernel
+    // 1 Block per Polynomial. 128 Threads per Block.
+    ntt_shared_mem_kernel<<<count, 128>>>(d_data_global);
+    cudaDeviceSynchronize();
+
+    // Copy Device -> Host
+    cudaMemcpy(host_batch_data, d_data_global, size, cudaMemcpyDeviceToHost);
+}
+EOF
+
+# ==============================================================================
+# 2. COMPILE & RUN
+# ==============================================================================
+echo "[Compiling] Optimized Kernels (SRAM)..."
+nvcc -c gpu_accelerator.cu -O3
+
+echo "[Linking]..."
+nvcc hybrid_benchmark.cu gpu_accelerator.o kem.o indcpa.o poly.o polyvec.o ntt.o cbd.o reduce.o verify.o randombytes.o fips202.o symmetric-shake.o -o hybrid_pro -O3
+
+echo "[Running Professional Benchmark]..."
+./hybrid_pro
